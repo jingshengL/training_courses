@@ -1,5 +1,5 @@
 """
-PTQ —— 静态量化（Static / calibration-based PTQ，FX graph 模式）
+第 4 课 · PTQ 静态量化（Static / calibration-based PTQ，FX graph 模式）
 
 流程三步走：
   1. prepare_fx：把 Conv/Linear 前后插入 observer，并把 Conv+BN+ReLU 自动融合
@@ -12,6 +12,7 @@ PTQ —— 静态量化（Static / calibration-based PTQ，FX graph 模式）
   * 校准算法怎么选 scale，是本脚本的核心实验
 
 运行： python ptq_static.py
+对应教程：README 第 4.2 节《静态量化（W8A8，需要校准）》
 """
 from __future__ import annotations
 

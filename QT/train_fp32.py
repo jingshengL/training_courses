@@ -1,4 +1,4 @@
-"""训练 FP32 baseline，并把权重存到 ckpt/fp32.pth，供后续所有量化脚本复用。
+"""第 2 课 · 训练 FP32 baseline，并把权重存到 ckpt/fp32.pth，供后续所有量化脚本复用。
 
 python train_fp32.py --epochs 6
 """

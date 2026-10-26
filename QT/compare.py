@@ -1,8 +1,9 @@
 """
-一键跑完所有方案并出总表：FP32 / PTQ-dynamic / PTQ-static / QAT。
+第 6 课 · 一键跑完所有方案并出总表：FP32 / PTQ-dynamic / PTQ-static / QAT。
 
 python compare.py            # 全部跑一遍（含 1 epoch QAT）
 python compare.py --fast     # 跳过 QAT，只看 PTQ
+对应教程：README 第 4.4 节《三条路线怎么选》
 """
 from __future__ import annotations
 

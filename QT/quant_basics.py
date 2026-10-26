@@ -1,8 +1,9 @@
 """
-量化数学与"手感"实验 —— 先把公式和直觉搞明白，再看框架 API。
+第 1 课 · 量化数学与"手感"实验 —— 先把公式和直觉搞明白，再看框架 API。
 
 运行： python quant_basics.py
 产物： outputs/sqnr_vs_bits.png, outputs/per_channel.png, outputs/calibration.png
+对应教程：README 第 3 节《量化到底做了什么》（E1~E5 分别是 3.3~3.7）
 
 ==================== 仿射量化（affine / asymmetric） ====================
             x_int = clamp(round(x / s) + z, qmin, qmax)

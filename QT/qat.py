@@ -1,5 +1,5 @@
 """
-QAT —— 量化感知训练（Quantization Aware Training）
+第 5 课 · QAT 量化感知训练（Quantization Aware Training）
 
 与 PTQ 的唯一本质区别：**在训练/微调的前向传播里插入 FakeQuantize 节点**，
 让网络"知道"自己将来会被量化，从而主动把权重/激活调整到 int8 网格能表示好的位置。
@@ -16,6 +16,7 @@ QAT —— 量化感知训练（Quantization Aware Training）
   6. convert 得到真正 int8 模型
 
 运行： python qat.py
+对应教程：README 第 4.3 节《QAT》
 """
 from __future__ import annotations
 

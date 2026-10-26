@@ -1,5 +1,5 @@
 """
-PTQ —— 动态量化（Dynamic / weight-only quantization）
+第 3 课 · PTQ 动态量化（Dynamic / weight-only quantization）
 
 思路：
   * 权重离线量化成 int8（离线算好 scale，甚至可以做 per-channel）
@@ -13,6 +13,7 @@ PTQ —— 动态量化（Dynamic / weight-only quantization）
 适用：NLP / Transformer 的 Linear 层、模型体积敏感、拿不到校准数据的场景。
 
 运行： python ptq_dynamic.py
+对应教程：README 第 4.1 节《动态量化（weight-only）》
 """
 from __future__ import annotations
 

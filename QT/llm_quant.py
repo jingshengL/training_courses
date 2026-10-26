@@ -1,5 +1,5 @@
 """
-大模型（LLM）weight-only 量化方法大乱斗 —— 全部只用一个 Linear 层讲清楚。
+第 7 课 · LLM weight-only 量化方法大乱斗 —— 全部只用一个 Linear 层讲清楚。
 
 为什么 LLM 走的是另一条路？
   Transformer 的激活里有极少数"离群通道"（magnitude 比其它通道大几十倍），
@@ -14,6 +14,7 @@
   5. LLM.int8() 风格混合精度  离群通道留 fp16，其余 int8
 
 运行： python llm_quant.py
+对应教程：README 第 5~6 节《为什么 LLM 走另一条路》/《方法地图》
 """
 from __future__ import annotations
 
@@ -49,56 +50,77 @@ def rel_err(X, W, W_hat) -> float:
 
 
 # ---------------------------------------------------------------- 1. RTN
-def quant_rtn(W, bits=4, scheme="per_channel", group_size=32, symmetric=True):
-    """Round-To-Nearest，最朴素的权重量化。
-    per_tensor : 整个矩阵一个 scale
+def quant_rtn(W, bits=4, scheme="per_channel", group_size=32):
+    """Round-To-Nearest，最朴素的权重量化（对称、zero_point=0）。
+
+    per_tensor : 整个矩阵共用一个 scale
     per_channel: 每个输出通道（行）一个 scale
-    per_group  : 行内每 group_size 个输入通道一个 scale（GPTQ/AWQ 标配，误差/开销折中）
+    per_group  : 行内每 group_size 个输入通道一个 scale（GPTQ/AWQ 的生产配置）
+
+    粒度越细 -> 单点幅值越小 -> 网格越密 -> 误差越小；
+    代价是 scale 的存储量与推理时的按组反量化开销。
     """
-    qmax = 2 ** (bits - 1) - 1
-    qmin = -qmax - 1 if symmetric else -qmax   # 对称用 -8..7(4bit)，非对称 -7..7
+    qmax = 2 ** (bits - 1) - 1          # 4bit -> [-7, 7]；对称量化不需要 zero_point
+    qmin = -qmax
     W = W.float()
+
+    def _q(w, scale):
+        return torch.clamp(torch.round(w / scale), qmin, qmax) * scale
+
     if scheme == "per_tensor":
-        scale = W.abs().max() / qmax
-        return fake_quantize(W, scale, torch.zeros_like(scale), bits, symmetric)
+        return _q(W, W.abs().max() / qmax)
     if scheme == "per_channel":
-        scale = W.abs().amax(dim=1, keepdim=True) / qmax
-        return fake_quantize(W, scale, torch.zeros_like(scale), bits, symmetric)
+        return _q(W, W.abs().amax(dim=1, keepdim=True) / qmax)
     if scheme == "per_group":
         o, i = W.shape
         pad = (-i) % group_size
         Wp = torch.nn.functional.pad(W, (0, pad)) if pad else W
         Wg = Wp.reshape(o, -1, group_size)
-        scale = Wg.abs().amax(dim=2, keepdim=True) / qmax
-        Qg = torch.clamp(torch.round(Wg / scale), qmin, qmax) * scale
+        Qg = _q(Wg, Wg.abs().amax(dim=2, keepdim=True) / qmax)
         return Qg.reshape(o, -1)[:, :i]
     raise ValueError(scheme)
 
 
 # ---------------------------------------------------------------- 2. GPTQ
-def quant_gptq(W, X, bits=4, blocksize=32, damp=0.01):
-    """GPTQ（简化版，单层 OBQ）：
-    H = X^T X 是"哪些权重误差更影响输出"的二阶度量。
-    逐列量化：q = RTN(w)；把 (w-q) 按 H^-1 的指引补偿到后面还没量化的列上。
+def quant_gptq(W, X, bits=4, blocksize=32, damp=0.01, group_size=None):
+    """GPTQ（单层版本，逐列量化 + 二阶误差补偿）。
+
+    核心：不是所有权重的重要性相同。H = X^T X 是输出的二阶度量，
+    它告诉我们"把这一列的量化误差挪到别的列上，对输出影响最小"。
+    逐列量化：q = RTN(w[:, j])，然后按 -1/H[j,j] 的比例把误差 w-q 摊到还没量化的列上。
+
+    group_size 给定时用 per-group scale（真实 GPTQ 的默认配置），否则 per-channel。
     """
     W = W.float().clone()
     o, i = W.shape
     H = (X.T @ X) / max(X.shape[0], 1)
-    H += damp * torch.eye(i) * torch.diag(H).mean()      # 数值稳定
-    Hinv = torch.linalg.cholesky_inverse(torch.linalg.cholesky(H))
+    H += damp * torch.eye(i) * torch.diag(H).mean()      # 阻尼：保证正定、避免病态矩阵炸掉
+    Hinv = torch.cholesky_inverse(torch.linalg.cholesky(H))
 
-    scale = W.abs().amax(dim=1, keepdim=True) / (2 ** (bits - 1) - 1)   # per-channel（按行）
-    qmax, qmin = 2 ** (bits - 1) - 1, -(2 ** (bits - 1))
+    qmax = 2 ** (bits - 1) - 1
+    if group_size:                                        # (o, i) 的逐组 scale
+        pad = (-i) % group_size
+        Wp = torch.nn.functional.pad(W, (0, pad)) if pad else W
+        scale = Wp.reshape(o, -1, group_size).abs().amax(dim=2).repeat_interleave(group_size, 1)[:, :i]
+        scale = scale / qmax
+    else:
+        scale = (W.abs().amax(dim=1, keepdim=True) / qmax).expand(o, i)   # expand 是视图，不占额外内存
+
     Q = torch.zeros_like(W)
-
-    for i1 in range(0, i, blocksize):
+    for i1 in range(0, i, blocksize):                     # 分块：把 H^-1 更新限制在块内，省算力
         i2 = min(i1 + blocksize, i)
-        for j in range(i1, i2):
-            w = W[:, j:j + 1]
-            q = torch.clamp(torch.round(w / scale), qmin, qmax) * scale
-            Q[:, j] = q.squeeze(1)
-            err = (w - q) / Hinv[j, j]                       # 量化误差
-            W[:, j:] -= err @ Hinv[j, j:].unsqueeze(0)       # 补偿到尚未量化的列
+        W1, Q1, Err1 = W[:, i1:i2].clone(), torch.zeros(o, i2 - i1), torch.zeros(o, i2 - i1)
+        Hinv1 = Hinv[i1:i2, i1:i2]
+        for j in range(i2 - i1):
+            w = W1[:, j]
+            q = torch.clamp(torch.round(w / scale[:, i1 + j]), -qmax, qmax) * scale[:, i1 + j]
+            Q1[:, j] = q
+            err = (w - q) / Hinv1[j, j]                   # 归一化后的量化误差
+            W1[:, j:] -= err.unsqueeze(1) @ Hinv1[j, j:].unsqueeze(0)   # 块内补偿
+            Err1[:, j] = err
+        Q[:, i1:i2] = Q1
+        if i2 < i:
+            W[:, i2:] -= Err1 @ Hinv[i1:i2, i2:]          # 块间补偿
     return Q
 
 
@@ -179,7 +201,9 @@ def main():
     for bits in [4, 3, 2]:
         add(f"RTN int{bits} per-group(32)", quant_rtn(W, bits, "per_group", 32))
     for bits in [4, 3, 2]:
-        add(f"GPTQ int{bits} (Hessian补偿)", quant_gptq(W, X, bits))
+        add(f"GPTQ int{bits} per-channel", quant_gptq(W, X, bits))
+    for bits in [4, 3, 2]:
+        add(f"GPTQ int{bits} per-group(32)", quant_gptq(W, X, bits, group_size=32))
     for bits in [4, 3]:
         add(f"AWQ int{bits} (激活感知scale)", quant_awq(X, W, bits)[0])
 
@@ -205,11 +229,14 @@ def main():
 
     from utils import fmt_table
     print(fmt_table(rows, ["方案", "输出相对误差", "SQNR(dB)"]))
-    print("\n读表结论：")
-    print("  * 粒度 per-tensor < per-channel < per-group：粒度越细误差越小，代价是 scale 的存储与寻址")
-    print("  * 同样 int4，GPTQ/AWQ 明显优于 RTN —— 它们用校准数据找「怎么量化更划算」")
-    print("  * 激活有离群点时朴素 W8A8 会崩，SmoothQuant 迁移 scale 后基本救回")
-    print("  * 极低位宽(2~3bit)必须配合 per-group + GPTQ/AWQ，否则不可用")
+    print("\n读表结论（都是本表实测值，可自己改参数复现）：")
+    print("  * 粒度：per-tensor > per-channel > per-group 的误差依次下降；")
+    print("    int4 只靠 per-tensor 基本不可用（误差 15%+），per-group(32) 才能压到 10% 以内。")
+    print("  * GPTQ 的收益要和「同粒度的 RTN」比：它是在 per-group 基础上再加二阶补偿，")
+    print("    所以 int4 提升有限、int3/int2 越来越明显（低比特时每一格都金贵）。")
+    print("  * AWQ 用激活统计给重要输入通道放大 scale，同等 int4 下误差最小 —— 单层就能赢 2~3 倍。")
+    print("  * 激活带离群点时朴素 W8A8(per-tensor) 会崩，SmoothQuant 把离群迁移到权重后基本救回。")
+    print("  * 极低位宽(2~3bit)必须「per-group + GPTQ/AWQ + 校准数据」三件套一起上，否则不可用。")
 
     # 画图
     names, errs = [], []
@@ -218,7 +245,7 @@ def main():
     plt.figure(figsize=(9, 5))
     plt.barh(range(len(errs)), errs, color="#4c72b0")
     plt.yticks(range(len(errs)), names, fontsize=8)
-    plt.xlabel("输出相对误差 (%)"); plt.title("LLM 权重量化方案对比（越低越好）")
+    plt.xlabel("output relative error (%)"); plt.title("LLM weight-only quantization: 1 Linear layer")
     plt.gca().invert_yaxis(); plt.tight_layout()
     plt.savefig(f"{OUT}/llm_quant.png", dpi=120)
     print(f"\n图已保存 -> {OUT}/llm_quant.png")
